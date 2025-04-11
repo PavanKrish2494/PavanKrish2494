@@ -1,78 +1,124 @@
 pipeline {
     agent any
 
+    parameters {
+        string(name: 'ECR_REPO_NAME', defaultValue: 'app-repo', description: 'Enter ECR repository name')
+        string(name: 'AWS_ACCOUNT_ID', defaultValue: '149536457645', description: 'Enter AWS Account ID')
+    }
+
+    tools {
+        jdk 'JDK'
+        nodejs 'NodeJS'
+    }
+
     environment {
-        AWS_REGION     = 'us-east-1'
-        ECR_REGISTRY   = '149536457645.dkr.ecr.us-east-1.amazonaws.com'
-        ECR_REPO       = 'app-repo'
-        IMAGE_NAME     = "${ECR_REGISTRY}/${ECR_REPO}"
-        IMAGE_TAG      = 'latest' // Or use BUILD_NUMBER if preferred
-        FULL_IMAGE     = "${IMAGE_NAME}:${IMAGE_TAG}"
+        SCANNER_HOME = tool 'SonarQube Scanner'
+        AWS_REGION = 'us-east-1'
     }
 
     stages {
-
-        stage('Checkout') {
+        stage('1. Git Checkout') {
             steps {
                 git branch: 'main', url: 'https://github.com/PavanKrish2494/PavanKrish2494.git'
             }
         }
 
-        stage('Build Docker Image') {
+        stage('2. SonarQube Analysis') {
             steps {
-                script {
-                    sh "docker build -t ${ECR_REPO} ."
-                }
-            }
-        }
-
-        stage('Run Tests') {
-            steps {
-                script {
-                    sh "npm install && npm test"
-                }
-            }
-        }
-
-        stage('Create ECR Repository (if not exists)') {
-            steps {
-                script {
+                withSonarQubeEnv('sonar-server') {
                     sh """
-                        aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_REGION} || \
-                        aws ecr create-repository --repository-name ${ECR_REPO} --region ${AWS_REGION}
+                    $SCANNER_HOME/bin/sonar-scanner \
+                    -Dsonar.projectName=app-repo \
+                    -Dsonar.projectKey=app-repo
                     """
                 }
             }
         }
 
-        stage('Login to ECR') {
+        stage('3. Quality Gate') {
             steps {
-                script {
-                    sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}"
-                }
+                waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
             }
         }
 
-        stage('Tag and Push Image to ECR') {
+        stage('4. Install Dependencies & Test') {
             steps {
-                script {
+                sh "npm install"
+                sh "npm test"
+            }
+        }
+
+        stage('5. Trivy Scan') {
+            steps {
+                sh "trivy fs . > trivy.txt"
+            }
+        }
+
+        stage('6. Build Docker Image') {
+            steps {
+                sh "docker build -t ${params.ECR_REPO_NAME} ."
+            }
+        }
+
+        stage('7. Create ECR Repository') {
+            steps {
+                withCredentials([string(credentialsId: 'access-key', variable: 'AWS_ACCESS_KEY'),
+                                 string(credentialsId: 'secret-key', variable: 'AWS_SECRET_KEY')]) {
                     sh """
-                        docker tag ${ECR_REPO}:latest ${FULL_IMAGE}
-                        docker push ${FULL_IMAGE}
+                    aws configure set aws_access_key_id $AWS_ACCESS_KEY
+                    aws configure set aws_secret_access_key $AWS_SECRET_KEY
+                    aws ecr describe-repositories --repository-names ${params.ECR_REPO_NAME} --region ${env.AWS_REGION} || \
+                    aws ecr create-repository --repository-name ${params.ECR_REPO_NAME} --region ${env.AWS_REGION}
                     """
                 }
             }
         }
 
-        stage('Deploy to EKS') {
+        stage('8. Login to ECR & Tag Image') {
             steps {
-                script {
+                withCredentials([string(credentialsId: 'access-key', variable: 'AWS_ACCESS_KEY'),
+                                 string(credentialsId: 'secret-key', variable: 'AWS_SECRET_KEY')]) {
                     sh """
-                        sed 's|IMAGE_PLACEHOLDER|${FULL_IMAGE}|g' k8s/deployment.yaml > k8s/deployment_temp.yaml
-                        kubectl apply -f k8s/deployment_temp.yaml
-                        kubectl apply -f k8s/service.yaml
+                    aws ecr get-login-password --region ${env.AWS_REGION} | docker login --username AWS --password-stdin ${params.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com
+                    docker tag ${params.ECR_REPO_NAME} ${params.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${params.ECR_REPO_NAME}:${BUILD_NUMBER}
+                    docker tag ${params.ECR_REPO_NAME} ${params.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${params.ECR_REPO_NAME}:latest
                     """
                 }
+            }
+        }
+
+        stage('9. Push Image to ECR') {
+            steps {
+                withCredentials([string(credentialsId: 'access-key', variable: 'AWS_ACCESS_KEY'),
+                                 string(credentialsId: 'secret-key', variable: 'AWS_SECRET_KEY')]) {
+                    sh """
+                    docker push ${params.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${params.ECR_REPO_NAME}:${BUILD_NUMBER}
+                    docker push ${params.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${params.ECR_REPO_NAME}:latest
+                    """
+                }
+            }
+        }
+
+        stage('10. Deploy to EKS') {
+            steps {
+                script {
+                    def imageUrl = "${params.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${params.ECR_REPO_NAME}:${BUILD_NUMBER}"
+                    sh """
+                    sed 's|IMAGE_PLACEHOLDER|${imageUrl}|g' k8s/deployment.yaml > k8s/deployment_temp.yaml
+                    kubectl apply -f k8s/deployment_temp.yaml
+                    kubectl apply -f k8s/service.yaml
+                    """
+                }
+            }
+        }
+
+        stage('11. Cleanup Docker Images') {
+            steps {
+                sh """
+                docker rmi ${params.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${params.ECR_REPO_NAME}:${BUILD_NUMBER} || true
+                docker rmi ${params.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${params.ECR_REPO_NAME}:latest || true
+                docker images
+                """
             }
         }
     }

@@ -1,0 +1,85 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION     = 'us-east-1'
+        ECR_REGISTRY   = '149536457645.dkr.ecr.us-east-1.amazonaws.com'
+        ECR_REPO       = 'app-repo'
+        IMAGE_NAME     = "${ECR_REGISTRY}/${ECR_REPO}"
+        IMAGE_TAG      = 'latest' // Or use BUILD_NUMBER if preferred
+        FULL_IMAGE     = "${IMAGE_NAME}:${IMAGE_TAG}"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/PavanKrish2494/PavanKrish2494.git'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh "docker build -t ${ECR_REPO} ."
+                }
+            }
+        }
+
+        stage('Run Tests') {
+            steps {
+                script {
+                    sh "npm install && npm test"
+                }
+            }
+        }
+
+        stage('Create ECR Repository (if not exists)') {
+            steps {
+                script {
+                    sh """
+                        aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_REGION} || \
+                        aws ecr create-repository --repository-name ${ECR_REPO} --region ${AWS_REGION}
+                    """
+                }
+            }
+        }
+
+        stage('Login to ECR') {
+            steps {
+                script {
+                    sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}"
+                }
+            }
+        }
+
+        stage('Tag and Push Image to ECR') {
+            steps {
+                script {
+                    sh """
+                        docker tag ${ECR_REPO}:latest ${FULL_IMAGE}
+                        docker push ${FULL_IMAGE}
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to EKS') {
+            steps {
+                script {
+                    sh """
+                        sed 's|IMAGE_PLACEHOLDER|${FULL_IMAGE}|g' k8s/deployment.yaml > k8s/deployment_temp.yaml
+                        kubectl apply -f k8s/deployment_temp.yaml
+                        kubectl apply -f k8s/service.yaml
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}

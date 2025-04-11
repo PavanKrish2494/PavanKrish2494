@@ -1,0 +1,18 @@
+apiVersion: elbv2.k8s.aws/v1beta1
+kind: TargetGroupBinding
+metadata:
+  name: node-app-tgb
+spec:
+  serviceRef:
+    name: node-app-service
+    port: 80
+  targetGroupARN: arn:aws:elasticloadbalancing:us-east-1:149536457645:targetgroup/app-tg/9585c27a75ccc8f0
+  targetType: ip
+  networking:
+    ingress:
+      - from:
+          - securityGroup:
+              groupID: sg-0c8f08de7bbb09a53
+        ports:
+          - protocol: TCP
+            port: 3000
